@@ -26,7 +26,7 @@ def min_max_normalization(a):
 
 
 class TimbreMetric(Metric):
-    def __init__(self, dataset=None, distance=l2, dist_sync_on_step=False):
+    def __init__(self, dataset=None, distance=l2, dist_sync_on_step=False, dissim_mat=None):
         super().__init__(dist_sync_on_step=dist_sync_on_step)
 
         self.distance = distance
@@ -35,8 +35,9 @@ class TimbreMetric(Metric):
         if not dataset:
             self.dissimilarity_matrices = {}
             for d in self.datasets:
+                dissimilarity_matrix = load_dissimilarity_matrix(d)
                 self.dissimilarity_matrices[d] = torch.tensor(
-                    load_dissimilarity_matrix(d)
+                    dissimilarity_matrix
                 )
         elif dataset not in self.datasets:
             raise ValueError(
@@ -45,7 +46,7 @@ class TimbreMetric(Metric):
             )
         else:
             self.dataset = dataset
-            self.dissimilarity_matrix = torch.tensor(load_dissimilarity_matrix(dataset))
+            self.dissimilarity_matrix = torch.tensor(load_dissimilarity_matrix(dataset)) if dissim_mat is None else dissim_mat
 
     def _validate_embeddings(self, embeddings: Union[torch.Tensor, dict]):
         if self.dataset:
@@ -86,8 +87,8 @@ class TimbreMetric(Metric):
 
 
 class TimbreMeanErrorMetric(TimbreMetric):
-    def __init__(self, dataset=None, distance=l2, dist_sync_on_step=False):
-        super().__init__(dataset, distance, dist_sync_on_step)
+    def __init__(self, dataset=None, distance=l2, dist_sync_on_step=False, dissim_mat=None):
+        super().__init__(dataset, distance, dist_sync_on_step, dissim_mat)
 
         error = torch.tensor(0) if self.dataset else torch.zeros(len(self.datasets))
         self.add_state("error", default=error, dist_reduce_fx="sum")
@@ -222,18 +223,22 @@ class TripletKNNAgreement(TimbreMeanErrorMetric):
         distance=pairwise_euclidean,
         dist_sync_on_step=False,
         k=5,
-        anchor_idx = None
+        anchor_idx = None,
+        k_nn_triplets = True,
+        dissim_mat = None,
     ):
         ''' Evaluate agreements to the triplet constraint D(a, i) < D(a, j)
             from a dissimilarity matrix D
         
         Args:
             k -- int: k-nearest neighborhood to evaluate for each anchor
-            anchor_idx -- int: if not None, evaluate around a single anchor
+            anchor_idx -- int: if not None, evaluate around a single anchor,
+            k_nn_triplets -- bool: selects triplets from an item's k-nearest neighborhood
         '''
-        super().__init__(dataset, distance, dist_sync_on_step)
+        super().__init__(dataset, distance, dist_sync_on_step, dissim_mat)
         self.k = k
         self.anchor_idx = anchor_idx
+        self.k_nn_triplets = k_nn_triplets
 
     def get_k_nn_triplets(self, target, anchor_idx):
         ''' Returns all possible pairs (i, j) for anchor a 
@@ -245,23 +250,31 @@ class TripletKNNAgreement(TimbreMeanErrorMetric):
         Returns:
             i_j_idxs: tensor of shape (N, 2) containing indices (i, j)
         '''
-        sorted_idxs = target[anchor_idx].argsort()
-        idxs = torch.tensor(sorted_idxs[sorted_idxs != anchor_idx])[:self.k]
+        idxs, _ = self.get_k_nn(target, anchor_idx)
         
         i_j_idxs = torch.stack([idxs[[i, j]] for i in range(len(idxs) - 1) 
                                     for j in range(i + 1, len(idxs))])
         return i_j_idxs
 
-    def get_k_nn(self, target, anchor_idx):
-        sorted_idxs = target[anchor_idx].argsort()
-        k_nn = sorted_idxs[sorted_idxs != anchor_idx][:self.k]
-        return k_nn, sorted_idxs
+    def get_triplets(self, target, anchor_idx):
+        i_idxs = self.get_k_nn(target, anchor_idx)
+        j_idxs = self.get_not_k_nn(target, anchor_idx)
 
-    def get_k_not_nn(self, target, anchor_idx):
-        _, sorted_idxs = self.get_k_nn(target, anchor_idx)
+        i_j_idxs = torch.stack([torch.tensor([i, j]) for i in i_idxs for j in j_idxs])
+        return i_j_idxs
+
+    def get_sorted_idxs(self, target, anchor_idx):
+        sorted_idxs = target[anchor_idx].argsort()
+        return sorted_idxs
+
+    def get_k_nn(self, target, anchor_idx):
+        sorted_idxs = self.get_sorted_idxs(target, anchor_idx)
+        k_nn = sorted_idxs[sorted_idxs != anchor_idx][:self.k]
+        return k_nn
+
+    def get_not_k_nn(self, target, anchor_idx):
+        sorted_idxs = self.get_sorted_idxs(target, anchor_idx)
         j = sorted_idxs[self.k + 1:]
-        j_shuffled_idxs = torch.randperm(len(j))
-        j = j[j_shuffled_idxs][:self.k]
         return j
 
     def _compute_item_error(self, target: torch.Tensor, distances: torch.Tensor):
@@ -272,7 +285,10 @@ class TripletKNNAgreement(TimbreMeanErrorMetric):
         anchors = range(target.shape[0]) if not self.anchor_idx else [self.anchor_idx]
 
         for anchor in anchors:
-            i_j_idxs = self.get_k_nn_triplets(target, anchor)
+            if self.k_nn_triplets:
+                i_j_idxs = self.get_k_nn_triplets(target, anchor)
+            else:
+                i_j_idxs = self.get_triplets(target, anchor)
             i = i_j_idxs[:, 0]
             j = i_j_idxs[:, 1]
             
@@ -280,7 +296,7 @@ class TripletKNNAgreement(TimbreMeanErrorMetric):
             triplet_agreements += torch.sum(distances[anchor, i] < distances[anchor, j])
 
         return (
-            torch.tensor(triplet_agreements / total_triplets)
+            triplet_agreements / total_triplets
             if total_triplets > 0
             else torch.tensor(float("nan"))
         )
@@ -296,8 +312,9 @@ class Mantel(TimbreMeanErrorMetric):
         distance=pairwise_euclidean,
         dist_sync_on_step=False,
         normalization=min_max_normalization,
+        dissim_mat=None
     ):
-        super().__init__(dataset, distance, dist_sync_on_step)
+        super().__init__(dataset, distance, dist_sync_on_step, dissim_mat)
         assert method in (
             "pearson",
             "spearman",
@@ -339,10 +356,11 @@ class Mantel(TimbreMeanErrorMetric):
         matrix[upper_tri_mask] = matrix[upper_tri_mask][permutation]
         return matrix
 
-    def _to_standardized_condensed_upper_triangle(self, matrix: torch.Tensor):
+    def _to_standardized_condensed_upper_triangle(self, matrix: torch.Tensor, normalize=False):
         condensed_matrix = self._to_condensed_upper_triangle(matrix)
-        normalized_condensed_matrix = self.normalization(condensed_matrix)
-        return normalized_condensed_matrix
+        if normalize:
+            condensed_matrix = self.normalization(condensed_matrix)
+        return condensed_matrix
 
     def _to_ranked_condensed_upper_triangle(self, matrix: torch.Tensor):
         condensed_matrix = self._to_condensed_upper_triangle(matrix)
@@ -350,8 +368,8 @@ class Mantel(TimbreMeanErrorMetric):
         return condensed_matrix.argsort()
 
     def _pearsonr(self, a: torch.Tensor, b: torch.Tensor):
-        a = self._to_standardized_condensed_upper_triangle(a)
-        b = self._to_standardized_condensed_upper_triangle(b)
+        a = self._to_standardized_condensed_upper_triangle(a, normalize=False)
+        b = self._to_standardized_condensed_upper_triangle(b, normalize=True)
 
         r = pearson_corrcoef(a, b) 
         return r

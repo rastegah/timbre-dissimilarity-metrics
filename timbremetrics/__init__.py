@@ -8,5 +8,5 @@ from .metrics import (
     MSE,
     ItemRankingAgreement,
     TripletAgreement,
-    TripletKNNAgreement,
+    TripletKNNAgreement
 )

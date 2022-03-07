@@ -302,6 +302,52 @@ class TripletKNNAgreement(TimbreMeanErrorMetric):
         )
 
 
+class TripletKNNPenaltyAgreement(TripletKNNAgreement):
+
+    def __init__(
+        self,
+        dataset=None,
+        distance=pairwise_euclidean,
+        dist_sync_on_step=False,
+        k=5,
+        anchor_idx = None,
+        k_nn_triplets = True,
+        dissim_mat = None,
+    ):
+        ''' Evaluate agreements to the triplet constraint D(a, i) < D(a, j)
+            from a dissimilarity matrix D
+        
+        Args:
+            k -- int: k-nearest neighborhood to evaluate for each anchor
+            anchor_idx -- int: if not None, evaluate around a single anchor,
+            k_nn_triplets -- bool: selects triplets from an item's k-nearest neighborhood
+        '''
+        super().__init__(dataset, distance, dist_sync_on_step, k, anchor_idx, k_nn_triplets, dissim_mat)
+
+    def _compute_item_error(self, target: torch.Tensor, distances: torch.Tensor):
+        target = target + target.T
+        triplet_agreements = []
+
+        anchors = range(target.shape[0]) if not self.anchor_idx else [self.anchor_idx]
+
+        for anchor in anchors:
+            if self.k_nn_triplets:
+                i_j_idxs = self.get_k_nn_triplets(target, anchor)
+            else:
+                i_j_idxs = self.get_triplets(target, anchor)
+            i = i_j_idxs[:, 0]
+            j = i_j_idxs[:, 1]
+
+            penalty = distances[i, j] / (distances[anchor, i] + distances[anchor, j])
+            indicator = torch.where(distances[anchor, i] < distances[anchor, j], 1, -1)
+
+            triplet_agreements.append(indicator * penalty)
+        ta = torch.concat(triplet_agreements)
+        ta_scaled = (ta - torch.min(ta)) / (torch.max(ta) - torch.min(ta))
+        mean_agreement = torch.mean(ta_scaled)
+        return mean_agreement
+
+
 class Mantel(TimbreMeanErrorMetric):
     def __init__(
         self,
